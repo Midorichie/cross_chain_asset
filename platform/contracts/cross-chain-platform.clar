@@ -1,172 +1,303 @@
-# Project Structure
+# Project Structure (Updated)
 .
 ├── README.md
 ├── contracts/
 │   ├── asset_bridge.clar
-│   └── vault.clar
+│   ├── vault.clar
+│   ├── governance.clar
+│   └── oracle.clar
 ├── src/
 │   ├── bitcoin/
 │   │   ├── __init__.py
-│   │   └── btc_client.py
+│   │   ├── btc_client.py
+│   │   └── multisig.py
 │   ├── stacks/
 │   │   ├── __init__.py
-│   │   └── stx_client.py
+│   │   ├── stx_client.py
+│   │   └── events.py
+│   ├── oracle/
+│   │   ├── __init__.py
+│   │   └── price_feed.py
 │   └── api/
 │       ├── __init__.py
-│       └── server.py
+│       ├── server.py
+│       └── webhooks.py
 └── tests/
-    └── test_bridge.py
+    ├── test_bridge.py
+    ├── test_multisig.py
+    └── test_oracle.py
 
-# README.md
-```markdown
-# Cross-Chain Asset Interoperability Platform
-
-A protocol for seamless cross-chain asset transfer between Bitcoin and other blockchains via Stacks.
-
-## Features
-- Secure asset locking and unlocking
-- Cross-chain verification
-- Atomic swaps
-- Asset representation on Stacks
-
-## Setup
-1. Install dependencies
-2. Configure Bitcoin and Stacks nodes
-3. Deploy smart contracts
-4. Run API server
-```
-
-# contracts/asset_bridge.clar
+# contracts/asset_bridge.clar (Updated)
 ```clarity
-;; Asset Bridge Contract
+;; Enhanced Asset Bridge Contract with Multi-sig and Oracle Support
 (define-data-var bridge-admin principal tx-sender)
+(define-data-var min-signatures uint u2)
+(define-data-var oracle-address principal 'SP000...)
+
+;; Custodian tracking
+(define-map custodians principal bool)
+(define-data-var custodian-count uint u0)
+
+;; Enhanced asset tracking with multi-sig support
 (define-map wrapped-assets 
     { btc-tx: (buff 32) }
     { amount: uint,
       recipient: principal,
-      status: (string-ascii 20) })
+      status: (string-ascii 20),
+      signatures: (list 10 principal),
+      oracle-price: uint,
+      timestamp: uint })
 
-(define-public (lock-btc (tx-hash (buff 32)) (amount uint) (recipient principal))
+;; Events for better tracking
+(define-public (emit-asset-locked (tx-hash (buff 32)) (amount uint))
+    (print { event: "asset-locked", tx-hash: tx-hash, amount: amount }))
+
+(define-public (emit-asset-released (tx-hash (buff 32)))
+    (print { event: "asset-released", tx-hash: tx-hash }))
+
+;; Multi-sig support
+(define-public (add-custodian (new-custodian principal))
     (begin
         (asserts! (is-eq tx-sender (var-get bridge-admin)) (err u1))
-        (map-set wrapped-assets
-            { btc-tx: tx-hash }
-            { amount: amount,
-              recipient: recipient,
-              status: "locked" })
+        (asserts! (is-none (map-get? custodians new-custodian)) (err u2))
+        (map-set custodians new-custodian true)
+        (var-set custodian-count (+ (var-get custodian-count) u1))
         (ok true)))
 
-(define-public (release-btc (tx-hash (buff 32)))
-    (let ((asset (unwrap! (map-get? wrapped-assets { btc-tx: tx-hash })
-                         (err u2))))
+(define-public (lock-btc (tx-hash (buff 32)) (amount uint) (recipient principal) (price uint))
+    (let ((signatures (list tx-sender)))
         (begin
-            (asserts! (is-eq (get status asset) "locked") (err u3))
-            (map-delete wrapped-assets { btc-tx: tx-hash })
+            (asserts! (map-get? custodians tx-sender) (err u3))
+            (asserts! (> amount u0) (err u4))
+            (map-set wrapped-assets
+                { btc-tx: tx-hash }
+                { amount: amount,
+                  recipient: recipient,
+                  status: "pending",
+                  signatures: signatures,
+                  oracle-price: price,
+                  timestamp: block-height })
+            (emit-asset-locked tx-hash amount)
             (ok true))))
+
+(define-public (sign-lock (tx-hash (buff 32)))
+    (let ((asset (unwrap! (map-get? wrapped-assets { btc-tx: tx-hash })
+                         (err u5)))
+          (current-signatures (get signatures asset)))
+        (begin
+            (asserts! (map-get? custodians tx-sender) (err u6))
+            (asserts! (is-none (index-of current-signatures tx-sender)) (err u7))
+            (asserts! (< (len current-signatures) (var-get min-signatures)) (err u8))
+            
+            (let ((new-signatures (unwrap! (as-max-len? 
+                                            (append current-signatures tx-sender)
+                                            u10)
+                                         (err u9))))
+                (if (>= (len new-signatures) (var-get min-signatures))
+                    (map-set wrapped-assets
+                        { btc-tx: tx-hash }
+                        (merge asset { 
+                            status: "locked",
+                            signatures: new-signatures }))
+                    (map-set wrapped-assets
+                        { btc-tx: tx-hash }
+                        (merge asset {
+                            signatures: new-signatures })))
+                (ok true)))))
 ```
 
-# src/bitcoin/btc_client.py
-```python
-from bitcoinrpc.authproxy import AuthServiceProxy
+# contracts/oracle.clar
+```clarity
+;; Price Oracle Contract
+(define-data-var oracle-admin principal tx-sender)
+(define-map price-feeds
+    { asset: (string-ascii 10) }
+    { price: uint,
+      timestamp: uint,
+      verified: bool })
 
-class BitcoinClient:
-    def __init__(self, rpc_user, rpc_password, rpc_host="localhost", rpc_port=8332):
-        self.rpc_connection = AuthServiceProxy(
-            f"http://{rpc_user}:{rpc_password}@{rpc_host}:{rpc_port}"
+(define-public (update-price (asset (string-ascii 10)) (price uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get oracle-admin)) (err u1))
+        (map-set price-feeds
+            { asset: asset }
+            { price: price,
+              timestamp: block-height,
+              verified: true })
+        (ok true)))
+
+(define-read-only (get-price (asset (string-ascii 10)))
+    (map-get? price-feeds { asset: asset }))
+```
+
+# src/bitcoin/multisig.py
+```python
+from typing import List
+import bitcoinutils
+from bitcoinutils.keys import PrivateKey, P2pkhAddress
+from bitcoinutils.script import Script
+from bitcoinutils.transactions import Transaction, TxInput, TxOutput
+
+class MultisigWallet:
+    def __init__(self, required_signatures: int, total_signers: int):
+        self.required_signatures = required_signatures
+        self.total_signers = total_signers
+        self.signers: List[PrivateKey] = []
+        
+    def add_signer(self, private_key: str):
+        """Add a signer to the multisig wallet."""
+        if len(self.signers) >= self.total_signers:
+            raise ValueError("Maximum number of signers reached")
+            
+        pk = PrivateKey(private_key)
+        self.signers.append(pk)
+        
+    def create_multisig_address(self) -> str:
+        """Create a P2SH multisig address."""
+        public_keys = [pk.get_public_key().to_hex() for pk in self.signers]
+        redeem_script = Script(f"OP_{self.required_signatures} " + 
+                             " ".join(public_keys) +
+                             f" OP_{self.total_signers} OP_CHECKMULTISIG")
+        
+        return redeem_script.to_p2sh_address()
+        
+    def sign_transaction(self, tx_hex: str, input_index: int, signer_index: int) -> str:
+        """Sign a transaction with a specific signer."""
+        if signer_index >= len(self.signers):
+            raise ValueError("Invalid signer index")
+            
+        tx = Transaction.from_hex(tx_hex)
+        signature = self.signers[signer_index].sign_input(
+            tx,
+            input_index,
+            Script(f"OP_{self.required_signatures} " +
+                  " ".join([pk.get_public_key().to_hex() for pk in self.signers]) +
+                  f" OP_{self.total_signers} OP_CHECKMULTISIG")
         )
-
-    def verify_transaction(self, tx_hash: str) -> dict:
-        """Verify Bitcoin transaction existence and confirmation status."""
-        try:
-            tx = self.rpc_connection.getrawtransaction(tx_hash, True)
-            confirmations = tx.get("confirmations", 0)
-            return {
-                "verified": confirmations >= 6,
-                "confirmations": confirmations,
-                "amount": self._get_transaction_amount(tx),
-                "recipient": self._get_recipient_address(tx)
-            }
-        except Exception as e:
-            raise Exception(f"Failed to verify transaction: {str(e)}")
-
-    def _get_transaction_amount(self, tx: dict) -> float:
-        """Extract the transaction amount."""
-        # Implementation specific to your requirements
-        return float(tx.get("vout")[0].get("value", 0))
-
-    def _get_recipient_address(self, tx: dict) -> str:
-        """Extract the recipient address."""
-        # Implementation specific to your requirements
-        return tx.get("vout")[0].get("scriptPubKey", {}).get("addresses", [""])[0]
+        
+        return tx.serialize()
 ```
 
-# src/stacks/stx_client.py
+# src/oracle/price_feed.py
 ```python
-from stacks_sdk import StacksClient, ContractCall
+import asyncio
+import aiohttp
+from typing import Dict, Optional
+from datetime import datetime
 
-class StacksClient:
-    def __init__(self, api_url: str, contract_address: str, contract_name: str):
-        self.client = StacksClient(api_url)
-        self.contract_address = contract_address
-        self.contract_name = contract_name
-
-    async def lock_btc(self, tx_hash: str, amount: int, recipient: str) -> dict:
-        """Lock BTC assets in the bridge contract."""
-        try:
-            contract_call = ContractCall(
-                contract_address=self.contract_address,
-                contract_name=self.contract_name,
-                function_name="lock-btc",
-                function_args=[tx_hash, amount, recipient]
-            )
+class PriceFeed:
+    def __init__(self, api_key: str, update_interval: int = 300):
+        self.api_key = api_key
+        self.update_interval = update_interval
+        self.prices: Dict[str, float] = {}
+        self.last_update: Optional[datetime] = None
+        
+    async def start(self):
+        """Start the price feed update loop."""
+        while True:
+            await self.update_prices()
+            await asyncio.sleep(self.update_interval)
             
-            result = await self.client.call_contract(contract_call)
-            return {
-                "success": result.success,
-                "txid": result.txid,
-                "status": "locked"
-            }
-        except Exception as e:
-            raise Exception(f"Failed to lock BTC: {str(e)}")
-
-    async def release_btc(self, tx_hash: str) -> dict:
-        """Release locked BTC assets."""
-        try:
-            contract_call = ContractCall(
-                contract_address=self.contract_address,
-                contract_name=self.contract_name,
-                function_name="release-btc",
-                function_args=[tx_hash]
-            )
-            
-            result = await self.client.call_contract(contract_call)
-            return {
-                "success": result.success,
-                "txid": result.txid,
-                "status": "released"
-            }
-        except Exception as e:
-            raise Exception(f"Failed to release BTC: {str(e)}")
+    async def update_prices(self):
+        """Update asset prices from external sources."""
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://api.coingecko.com/v3/simple/price",
+                params={
+                    "ids": "bitcoin",
+                    "vs_currencies": "usd",
+                    "api_key": self.api_key
+                }
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    self.prices["BTC"] = data["bitcoin"]["usd"]
+                    self.last_update = datetime.now()
+                    
+    def get_price(self, asset: str) -> Optional[float]:
+        """Get the latest price for an asset."""
+        return self.prices.get(asset)
 ```
 
-# src/api/server.py
+# src/api/webhooks.py
 ```python
-from fastapi import FastAPI, HTTPException
+from fastapi import APIRouter, BackgroundTasks
+from pydantic import BaseModel
+from typing import Dict, Any
+import aiohttp
+import json
+
+router = APIRouter()
+
+class WebhookConfig(BaseModel):
+    url: str
+    events: list[str]
+    
+class WebhookManager:
+    def __init__(self):
+        self.webhooks: Dict[str, WebhookConfig] = {}
+        
+    async def trigger_webhook(
+        self,
+        event: str,
+        data: Dict[str, Any]
+    ):
+        """Trigger webhooks for a specific event."""
+        for webhook_id, config in self.webhooks.items():
+            if event in config.events:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        await session.post(
+                            config.url,
+                            json={
+                                "event": event,
+                                "data": data,
+                                "timestamp": datetime.now().isoformat()
+                            }
+                        )
+                except Exception as e:
+                    print(f"Webhook delivery failed: {str(e)}")
+                    
+webhook_manager = WebhookManager()
+
+@router.post("/webhooks")
+async def register_webhook(config: WebhookConfig):
+    """Register a new webhook."""
+    webhook_id = f"wh_{len(webhook_manager.webhooks) + 1}"
+    webhook_manager.webhooks[webhook_id] = config
+    return {"id": webhook_id, "status": "registered"}
+```
+
+# src/api/server.py (Updated)
+```python
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 from ..bitcoin.btc_client import BitcoinClient
+from ..bitcoin.multisig import MultisigWallet
 from ..stacks.stx_client import StacksClient
+from ..oracle.price_feed import PriceFeed
+from .webhooks import webhook_manager
 
 app = FastAPI()
 
-class BridgeRequest(BaseModel):
-    btc_tx_hash: str
-    recipient_address: str
-    amount: float
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize components
+price_feed = PriceFeed(api_key="your_api_key")
+multisig_wallet = MultisigWallet(required_signatures=2, total_signers=3)
 
 @app.post("/bridge/lock")
-async def lock_btc(request: BridgeRequest):
-    """Lock BTC and mint wrapped assets on Stacks."""
+async def lock_btc(request: BridgeRequest, background_tasks: BackgroundTasks):
+    """Enhanced lock BTC endpoint with multi-sig and price oracle support."""
     try:
         # Verify Bitcoin transaction
         btc_client = BitcoinClient(
@@ -180,8 +311,16 @@ async def lock_btc(request: BridgeRequest):
                 status_code=400,
                 detail="Transaction not confirmed"
             )
-
-        # Lock assets on Stacks
+            
+        # Get current BTC price
+        btc_price = price_feed.get_price("BTC")
+        if not btc_price:
+            raise HTTPException(
+                status_code=500,
+                detail="Price feed unavailable"
+            )
+            
+        # Initialize multi-sig transaction
         stx_client = StacksClient(
             api_url="your_api_url",
             contract_address="your_contract_address",
@@ -191,16 +330,35 @@ async def lock_btc(request: BridgeRequest):
         lock_result = await stx_client.lock_btc(
             request.btc_tx_hash,
             request.amount,
-            request.recipient_address
+            request.recipient_address,
+            int(btc_price * 100)  # Convert to integer with 2 decimal places
+        )
+        
+        # Trigger webhook for lock event
+        background_tasks.add_task(
+            webhook_manager.trigger_webhook,
+            "btc_locked",
+            {
+                "tx_hash": request.btc_tx_hash,
+                "amount": request.amount,
+                "price": btc_price
+            }
         )
         
         return {
             "status": "success",
             "lock_txid": lock_result["txid"],
-            "details": lock_result
+            "details": lock_result,
+            "price": btc_price
         }
         
     except Exception as e:
+        # Trigger webhook for error event
+        background_tasks.add_task(
+            webhook_manager.trigger_webhook,
+            "error",
+            {"error": str(e)}
+        )
         raise HTTPException(
             status_code=500,
             detail=str(e)
